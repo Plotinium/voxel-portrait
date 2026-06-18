@@ -159,7 +159,7 @@ function parseColorToRgb(color: string): { r: number; g: number; b: number } {
   return hexToRgb(FALLBACK_COLOR);
 }
 
-function normalizeColorToHex(color: string): string {
+export function normalizeColorToHex(color: string): string {
   const { r, g, b } = parseColorToRgb(color);
   return rgbToHex(r, g, b);
 }

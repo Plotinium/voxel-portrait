@@ -1,10 +1,18 @@
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { extractImagePixels, ExtractImagePixelsOptions } from './lib/image/extractImagePixels';
-import { generateVoxelMap } from './lib/image/generateVoxelMap';
-import { createExplosionTargets } from './lib/animation/createExplosionTargets';
-import { resolveVoxelColor } from './lib/theme/colorResolver';
+import {
+  extractImagePixels,
+  type ExtractedImagePixels,
+  type ExtractImagePixelsOptions,
+} from './lib/image/extractImagePixels';
+import {
+  buildVoxelPortrait,
+  type BuildVoxelPortraitRequest,
+  type BuildVoxelPortraitResponse,
+  type BuildVoxelPortraitResult,
+} from './lib/voxel/buildVoxelPortrait';
+import { normalizeColorToHex } from './lib/theme/colorResolver';
 import { VoxelPortraitScene } from './VoxelPortraitScene';
 import type { VoxelColorConfig, VoxelCubeData } from './types/voxelPortrait';
 
@@ -236,6 +244,103 @@ const DEFAULT_OPTIONS: Required<VoxelPortraitCanvasOptions> = {
 
 export const DEFAULT_VOXEL_CANVAS_OPTIONS = DEFAULT_OPTIONS;
 
+type CachedPixels = {
+  signature: string;
+  pixels: ExtractedImagePixels;
+};
+
+let voxelBuildWorkerUrl: string | null = null;
+
+function createVoxelBuildWorker(): Worker | null {
+  if (
+    typeof window === 'undefined'
+    || typeof Worker === 'undefined'
+    || typeof Blob === 'undefined'
+    || typeof URL === 'undefined'
+  ) {
+    return null;
+  }
+
+  try {
+    if (!voxelBuildWorkerUrl) {
+      const workerScript = `const buildVoxelPortrait = ${buildVoxelPortrait.toString()};self.onmessage = function(event) {try { const result = buildVoxelPortrait(event.data); self.postMessage({ ok: true, result: result }); } catch (error) { self.postMessage({ ok: false, error: error instanceof Error ? error.message : 'Voxel worker failed.' }); }};`;
+      voxelBuildWorkerUrl = URL.createObjectURL(new Blob([workerScript], { type: 'text/javascript' }));
+    }
+
+    return new Worker(voxelBuildWorkerUrl);
+  } catch (error) {
+    console.warn('[VoxelPortraitCanvas] Falling back to main-thread voxel generation.', error);
+    return null;
+  }
+}
+
+function runVoxelBuildInWorker(
+  request: BuildVoxelPortraitRequest,
+): Promise<BuildVoxelPortraitResult> {
+  const worker = createVoxelBuildWorker();
+
+  if (!worker) {
+    return Promise.resolve(buildVoxelPortrait(request));
+  }
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      worker.removeEventListener('message', handleMessage);
+      worker.removeEventListener('error', handleError);
+      worker.terminate();
+    };
+
+    const handleMessage = (event: MessageEvent<BuildVoxelPortraitResponse>) => {
+      cleanup();
+      if (event.data.ok) {
+        resolve(event.data.result);
+        return;
+      }
+
+      reject(new Error(event.data.error));
+    };
+
+    const handleError = (event: ErrorEvent) => {
+      cleanup();
+      reject(event.error instanceof Error ? event.error : new Error(event.message || 'Voxel worker failed.'));
+    };
+
+    worker.addEventListener('message', handleMessage);
+    worker.addEventListener('error', handleError);
+    worker.postMessage(request);
+  });
+}
+
+function normalizeColorConfigForBuild(colorConfig: VoxelColorConfig): VoxelColorConfig {
+  switch (colorConfig.mode) {
+    case 'solid':
+      return {
+        mode: 'solid',
+        value: normalizeColorToHex(colorConfig.value),
+      };
+    case 'gradient':
+      return {
+        mode: 'gradient',
+        palette: colorConfig.palette.map((color) => normalizeColorToHex(color)),
+        direction: colorConfig.direction,
+      };
+    case 'randomPalette':
+      return {
+        mode: 'randomPalette',
+        palette: colorConfig.palette.map((color) => normalizeColorToHex(color)),
+        seed: colorConfig.seed,
+      };
+    case 'imageSampled':
+      return {
+        mode: 'imageSampled',
+        tint: colorConfig.tint ? normalizeColorToHex(colorConfig.tint) : undefined,
+        tintStrength: colorConfig.tintStrength,
+      };
+    default:
+      return colorConfig;
+  }
+}
+
 function lightenHex(hex: string, amount: number): string {
   const normalized = hex.replace('#', '');
   if (normalized.length !== 6) {
@@ -261,12 +366,16 @@ export function VoxelPortraitCanvas({
 }: VoxelPortraitCanvasProps) {
   const [cubes, setCubes] = useState<VoxelCubeData[] | null>(null);
   const [cubeSize, setCubeSize] = useState(0.05);
+  const [cachedPixels, setCachedPixels] = useState<CachedPixels | null>(null);
   const [failed, setFailed] = useState(false);
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [isPreparing, setIsPreparing] = useState(false);
   const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
   const [isHovering, setIsHovering] = useState(false);
   const [isPointerDown, setIsPointerDown] = useState(false);
   const [themeVersion, setThemeVersion] = useState(0);
-  const generationRunRef = useRef(0);
+  const extractRunRef = useRef(0);
+  const prepareRunRef = useRef(0);
 
   const mergedOptions = useMemo(() => ({
     color: {
@@ -426,12 +535,15 @@ export function VoxelPortraitCanvas({
     };
   }, [mergedOptions.color, themeVersion]);
 
-  const voxelBuildSignature = useMemo(
+  const normalizedColorConfig = useMemo(
+    () => normalizeColorConfigForBuild(resolvedColorConfig),
+    [resolvedColorConfig],
+  );
+
+  const pixelExtractionSignature = useMemo(
     () => JSON.stringify({
       imageSrc,
-      colorConfig: resolvedColorConfig,
-      generation: mergedOptions.generation,
-      explosion: mergedOptions.explosion,
+      maxResolution: mergedOptions.generation.maxResolution,
       imageTransform: {
         imageScale: mergedOptions.render.imageScale,
         imageOffsetX: mergedOptions.render.imageOffsetX,
@@ -441,13 +553,36 @@ export function VoxelPortraitCanvas({
     }),
     [
       imageSrc,
-      resolvedColorConfig,
-      mergedOptions.generation,
-      mergedOptions.explosion,
+      mergedOptions.generation.maxResolution,
       mergedOptions.render.imageScale,
       mergedOptions.render.imageOffsetX,
       mergedOptions.render.imageOffsetY,
       mergedOptions.render.imageRotationDeg,
+    ],
+  );
+
+  const voxelBuildSignature = useMemo(
+    () => JSON.stringify({
+      pixels: pixelExtractionSignature,
+      colorConfig: normalizedColorConfig,
+      generation: {
+        density: mergedOptions.generation.density,
+        cubeSize: mergedOptions.generation.cubeSize,
+        alphaThreshold: mergedOptions.generation.alphaThreshold,
+        maxCubes: mergedOptions.generation.maxCubes,
+        depthMultiplier: mergedOptions.generation.depthMultiplier,
+      },
+      explosion: mergedOptions.explosion,
+    }),
+    [
+      pixelExtractionSignature,
+      normalizedColorConfig,
+      mergedOptions.generation.density,
+      mergedOptions.generation.cubeSize,
+      mergedOptions.generation.alphaThreshold,
+      mergedOptions.generation.maxCubes,
+      mergedOptions.generation.depthMultiplier,
+      mergedOptions.explosion,
     ],
   );
 
@@ -465,11 +600,11 @@ export function VoxelPortraitCanvas({
 
   useEffect(() => {
     let cancelled = false;
-    generationRunRef.current += 1;
-    const runId = generationRunRef.current;
-    onGenerationStateChange?.(true);
+    extractRunRef.current += 1;
+    const runId = extractRunRef.current;
+    setIsExtracting(true);
 
-    async function generateVoxels() {
+    async function loadPixels() {
       try {
         setFailed(false);
 
@@ -483,51 +618,109 @@ export function VoxelPortraitCanvas({
 
         const pixels = await extractImagePixels(imageSrc, extractImageOptions);
 
-        const maxCubes = mergedOptions.generation.maxCubes ?? 8000;
-        const density = mergedOptions.generation.density ?? 0.8;
-        const cubeSize = mergedOptions.generation.cubeSize ?? 0.05;
-
-        const points = generateVoxelMap(pixels, {
-          density,
-          cubeSize,
-          alphaThreshold: mergedOptions.generation.alphaThreshold ?? 12,
-          maxCubes,
-          depthMultiplier: mergedOptions.generation.depthMultiplier ?? 18,
-        });
-
-        const prepared = createExplosionTargets(
-          points,
-          (point) => resolveVoxelColor(point, points, resolvedColorConfig),
-          {
-            strength: mergedOptions.explosion.strength ?? 2.45,
-            depthStrength: mergedOptions.explosion.depthStrength ?? 2.1,
-            rotationStrength: mergedOptions.explosion.rotationStrength ?? 1,
-            seed: mergedOptions.explosion.seed ?? 42,
-          },
-        );
-
-        if (!cancelled) {
-          setCubeSize(cubeSize);
-          setCubes(prepared);
+        if (!cancelled && runId === extractRunRef.current) {
+          setCachedPixels({
+            signature: pixelExtractionSignature,
+            pixels,
+          });
         }
       } catch (err) {
-        console.error('[VoxelPortraitCanvas] generateVoxels failed:', err);
-        if (!cancelled) {
+        console.error('[VoxelPortraitCanvas] extractImagePixels failed:', err);
+        if (!cancelled && runId === extractRunRef.current) {
           setFailed(true);
         }
       } finally {
-        if (!cancelled && runId === generationRunRef.current) {
-          onGenerationStateChange?.(false);
+        if (!cancelled && runId === extractRunRef.current) {
+          setIsExtracting(false);
         }
       }
     }
 
-    generateVoxels();
+    loadPixels();
 
     return () => {
       cancelled = true;
     };
-  }, [voxelBuildSignature, onGenerationStateChange]);
+  }, [
+    pixelExtractionSignature,
+    imageSrc,
+    mergedOptions.generation.maxResolution,
+    mergedOptions.render.imageScale,
+    mergedOptions.render.imageOffsetX,
+    mergedOptions.render.imageOffsetY,
+    mergedOptions.render.imageRotationDeg,
+  ]);
+
+  useEffect(() => {
+    if (!cachedPixels || cachedPixels.signature !== pixelExtractionSignature) {
+      return;
+    }
+
+    let cancelled = false;
+    prepareRunRef.current += 1;
+    const runId = prepareRunRef.current;
+    setIsPreparing(true);
+
+    const request: BuildVoxelPortraitRequest = {
+      pixels: cachedPixels.pixels,
+      colorConfig: normalizedColorConfig,
+      generation: {
+        density: mergedOptions.generation.density,
+        cubeSize: mergedOptions.generation.cubeSize,
+        alphaThreshold: mergedOptions.generation.alphaThreshold,
+        maxCubes: mergedOptions.generation.maxCubes,
+        depthMultiplier: mergedOptions.generation.depthMultiplier,
+      },
+      explosion: {
+        strength: mergedOptions.explosion.strength,
+        depthStrength: mergedOptions.explosion.depthStrength,
+        rotationStrength: mergedOptions.explosion.rotationStrength,
+        seed: mergedOptions.explosion.seed,
+      },
+    };
+
+    runVoxelBuildInWorker(request)
+      .then((prepared) => {
+        if (!cancelled && runId === prepareRunRef.current) {
+          setFailed(false);
+          setCubeSize(prepared.cubeSize);
+          setCubes(prepared.cubes);
+        }
+      })
+      .catch((err) => {
+        console.error('[VoxelPortraitCanvas] buildVoxelPortrait failed:', err);
+        if (!cancelled && runId === prepareRunRef.current) {
+          setFailed(true);
+        }
+      })
+      .finally(() => {
+        if (!cancelled && runId === prepareRunRef.current) {
+          setIsPreparing(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    cachedPixels,
+    pixelExtractionSignature,
+    voxelBuildSignature,
+    normalizedColorConfig,
+    mergedOptions.generation.density,
+    mergedOptions.generation.cubeSize,
+    mergedOptions.generation.alphaThreshold,
+    mergedOptions.generation.maxCubes,
+    mergedOptions.generation.depthMultiplier,
+    mergedOptions.explosion.strength,
+    mergedOptions.explosion.depthStrength,
+    mergedOptions.explosion.rotationStrength,
+    mergedOptions.explosion.seed,
+  ]);
+
+  useEffect(() => {
+    onGenerationStateChange?.(isExtracting || isPreparing);
+  }, [isExtracting, isPreparing, onGenerationStateChange]);
 
   useEffect(() => () => {
     onGenerationStateChange?.(false);

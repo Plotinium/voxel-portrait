@@ -78,7 +78,7 @@ export default function HeroPortrait() {
 | `fallbackImage` | `string` | No | Fallback image if the main image fails to load |
 | `progress` | `number` | Yes | Animation progress, typically normalized between `0` and `1` |
 | `options` | `VoxelPortraitCanvasOptions` | No | Rendering and behavior configuration |
-| `onGenerationStateChange` | `(isGenerating: boolean) => void` | No | Called while voxel generation is running |
+| `onGenerationStateChange` | `(isGenerating: boolean) => void` | No | Called while image extraction or voxel generation is running so the consuming page can show its own loading UI |
 
 ## Configuration overview
 
@@ -111,6 +111,8 @@ Type exports are also available for the main canvas options and voxel data struc
 ## Styling and layout
 
 The component renders a Three.js canvas, so it should be placed inside a container with an explicit height.
+
+While a new image or settings change is being prepared, the current voxel scene stays mounted until the replacement data is ready. In browsers with Web Worker support, voxel preparation runs off the main thread so consuming pages can keep their own UI responsive and decide whether to show a spinner, disable controls, or allow uninterrupted interaction.
 
 For best results:
 

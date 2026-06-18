@@ -1,4 +1,4 @@
-type ExtractedImagePixels = {
+export type ExtractedImagePixels = {
   width: number;
   height: number;
   data: Uint8ClampedArray;
