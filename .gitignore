@@ -1,0 +1,22 @@
+node_modules/
+dist/
+PUBLISHING.md
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.*
+
+# Coverage and caches
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

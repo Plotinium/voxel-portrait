@@ -1,0 +1,53 @@
+{
+  "name": "@plotinium/voxel-portrait",
+  "version": "1.0.0",
+  "description": "Scroll-driven 3D voxel portrait canvas component for React. Converts any image into an interactive particle sculpture powered by React Three Fiber.",
+  "keywords": ["react", "three.js", "r3f", "voxel", "3d", "canvas", "portrait", "animation", "scroll"],
+  "author": "Plotinium",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Plotinium/voxel-portrait.git"
+  },
+  "homepage": "https://github.com/Plotinium/voxel-portrait#readme",
+  "bugs": {
+    "url": "https://github.com/Plotinium/voxel-portrait/issues"
+  },
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --external react --external react-dom --external three --external @react-three/fiber --external @react-three/drei",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch --external react --external react-dom --external three --external @react-three/fiber --external @react-three/drei",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18",
+    "@react-three/fiber": ">=8",
+    "@react-three/drei": ">=9",
+    "three": ">=0.150"
+  },
+  "devDependencies": {
+    "@react-three/drei": "^10.0.0",
+    "@react-three/fiber": "^9.0.0",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/three": "^0.177.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": "^0.184.0",
+    "tsup": "^8",
+    "typescript": "^5"
+  }
+}
