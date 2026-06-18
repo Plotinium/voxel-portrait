@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Plotinium/voxel-portrait.git"
+    "url": "git+https://github.com/Plotinium/voxel-portrait.git"
   },
   "homepage": "https://github.com/Plotinium/voxel-portrait#readme",
   "bugs": {
