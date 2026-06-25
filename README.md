@@ -1,5 +1,7 @@
 # voxel-portrait
 
+> **[Try the live demo at plotinium.dev](https://plotinium.dev/)**
+
 `@plotinium/voxel-portrait` is a React component that turns an image into a scroll-driven 3D voxel portrait using React Three Fiber.
 
 It is designed for landing pages, portfolio sections, and immersive hero blocks where a static image needs a stronger visual treatment without building a custom Three.js scene from scratch.
