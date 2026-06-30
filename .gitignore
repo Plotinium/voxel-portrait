@@ -20,3 +20,7 @@ coverage/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Local tooling / agent scratch
+.claude/
+skills-lock.json

@@ -1,6 +1,6 @@
 {
   "name": "@plotinium/voxel-portrait",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Scroll-driven 3D voxel portrait canvas component for React. Converts any image into an interactive particle sculpture powered by React Three Fiber.",
   "keywords": ["react", "three.js", "r3f", "voxel", "3d", "canvas", "portrait", "animation", "scroll"],
   "author": "Plotinium",

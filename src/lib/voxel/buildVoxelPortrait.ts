@@ -29,10 +29,13 @@ export type BuildVoxelPortraitResponse =
   | {
       ok: true;
       result: BuildVoxelPortraitResult;
+      /** Echoed back so a pooled worker can match responses to requests. */
+      requestId?: number;
     }
   | {
       ok: false;
       error: string;
+      requestId?: number;
     };
 
 export function buildVoxelPortrait(

@@ -1,6 +1,10 @@
 import { Canvas } from '@react-three/fiber';
-import { OrbitControls } from '@react-three/drei';
+import { OrbitControls, PerformanceMonitor } from '@react-three/drei';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  resolveQualityProfile,
+  type QualityLevel,
+} from './lib/quality/resolveQuality';
 import {
   extractImagePixels,
   type ExtractedImagePixels,
@@ -13,8 +17,10 @@ import {
   type BuildVoxelPortraitResult,
 } from './lib/voxel/buildVoxelPortrait';
 import { normalizeColorToHex } from './lib/theme/colorResolver';
-import { VoxelPortraitScene } from './VoxelPortraitScene';
+import { VoxelPortraitScene, type PerfSample } from './VoxelPortraitScene';
 import type { VoxelColorConfig, VoxelCubeData } from './types/voxelPortrait';
+
+export type { PerfSample };
 
 export type VoxelPortraitColorOptions = {
   mode?: 'solid' | 'gradient' | 'imageSampled';
@@ -36,7 +42,25 @@ export type VoxelPortraitColorOptions = {
   };
 };
 
+export type VoxelTransitionOptions = {
+  /** Play a particle-storm animation when the image changes. Default `true`. */
+  enabled?: boolean;
+  /** Built-in storm style, or any name registered in the transition registry. */
+  style?: 'vortex' | 'spiral' | 'turbulence' | (string & {});
+  /** Seconds to scatter the current portrait into the storm. */
+  disperseDuration?: number;
+  /** Seconds to reassemble the new portrait from the storm. */
+  convergeDuration?: number;
+  /** Minimum seconds the storm holds before reassembling (hides fast loads). */
+  minHold?: number;
+  /** Per-style tuning (e.g. `radius`, `speed`, `arms`). */
+  params?: Record<string, number>;
+};
+
 export type VoxelPortraitCanvasOptions = {
+  /** Rendering quality. `auto` detects the device and throttles at runtime. */
+  quality?: QualityLevel;
+  transition?: VoxelTransitionOptions;
   color?: VoxelPortraitColorOptions;
   render?: {
     portraitScale?: number;
@@ -44,6 +68,13 @@ export type VoxelPortraitCanvasOptions = {
     imageOffsetX?: number;
     imageOffsetY?: number;
     imageRotationDeg?: number;
+    /**
+     * Keep the WebGL drawing buffer so the canvas can be captured via
+     * `toDataURL()` / `toBlob()`. Off by default — enabling it disables a
+     * browser fast path and adds a per-frame copy cost. Only turn on if you
+     * screenshot the canvas.
+     */
+    preserveDrawingBuffer?: boolean;
   };
   generation?: {
     maxResolution?: number | false;
@@ -128,15 +159,63 @@ export type VoxelPortraitCanvasOptions = {
   };
 };
 
+/** The phases the particle-storm state machine passes through. */
+export type VoxelStormPhase = 'idle' | 'disperse' | 'hold' | 'converge';
+
 type VoxelPortraitCanvasProps = {
   imageSrc: string;
   fallbackImage?: string;
   progress: number;
   options?: VoxelPortraitCanvasOptions;
   onGenerationStateChange?: (isGenerating: boolean) => void;
+  /**
+   * Increment this to replay the particle-storm transition against the current
+   * image (no rebuild) — handy for previewing/comparing styles. Triggers the
+   * animation even if `transition.enabled` is false or reduced-motion is set.
+   */
+  replayToken?: number;
+  /**
+   * Bump to start a storm and HOLD it open: disperse → hold. The storm stays in
+   * `hold` indefinitely (no auto-converge) until `convergeToken` changes. Fires
+   * independently of `imageSrc` / `replayToken`. Intended for driving a route
+   * transition where the hold spans an externally-controlled duration.
+   *
+   * Like `replayToken`, this is an explicit consumer action: it runs even when
+   * `transition.enabled` is false or reduced-motion is set. Use
+   * `onStormPhaseChange` to sequence around it.
+   */
+  disperseToken?: number;
+  /**
+   * Bump to release a held storm: hold → converge, reassembling the CURRENT
+   * cubes (no `imageSrc` change required). Respects `transition.minHold` (won't
+   * converge earlier than `minHold` after the hold began). A bump received while
+   * still in `disperse` is latched and applied once `hold` is entered.
+   */
+  convergeToken?: number;
+  /**
+   * Fired on every storm phase change, including the final `→ idle`. Lets the
+   * consumer sequence routing (e.g. push the next route on `hold`, reveal it on
+   * `idle`).
+   */
+  onStormPhaseChange?: (phase: VoxelStormPhase) => void;
+  /**
+   * Fired roughly once per second with `{ fps, dropped, dpr }` telemetry from the
+   * render loop. Useful for monitoring smoothness or proving performance in a
+   * demo. Held in a ref internally, so passing a fresh closure won't re-render.
+   */
+  onPerfSample?: (sample: PerfSample) => void;
 };
 
 const DEFAULT_OPTIONS: Required<VoxelPortraitCanvasOptions> = {
+  quality: 'auto',
+  transition: {
+    enabled: true,
+    style: 'vortex',
+    disperseDuration: 0.6,
+    convergeDuration: 0.7,
+    minHold: 0.25,
+    params: {},
+  },
   color: {
     mode: 'imageSampled',
     useTheme: false,
@@ -162,6 +241,7 @@ const DEFAULT_OPTIONS: Required<VoxelPortraitCanvasOptions> = {
     imageOffsetX: 0,
     imageOffsetY: 0,
     imageRotationDeg: 0,
+    preserveDrawingBuffer: false,
   },
   generation: {
     maxResolution: 768,
@@ -251,6 +331,8 @@ type CachedPixels = {
 
 let voxelBuildWorkerUrl: string | null = null;
 
+// The blob URL is built once per page (the worker source never changes) and
+// shared by every worker instance; only the `Worker` objects are per-component.
 function createVoxelBuildWorker(): Worker | null {
   if (
     typeof window === 'undefined'
@@ -263,7 +345,7 @@ function createVoxelBuildWorker(): Worker | null {
 
   try {
     if (!voxelBuildWorkerUrl) {
-      const workerScript = `const buildVoxelPortrait = ${buildVoxelPortrait.toString()};self.onmessage = function(event) {try { const result = buildVoxelPortrait(event.data); self.postMessage({ ok: true, result: result }); } catch (error) { self.postMessage({ ok: false, error: error instanceof Error ? error.message : 'Voxel worker failed.' }); }};`;
+      const workerScript = `const buildVoxelPortrait = ${buildVoxelPortrait.toString()};self.onmessage = function(event) {var requestId = event.data && event.data.requestId;try { const result = buildVoxelPortrait(event.data); self.postMessage({ ok: true, result: result, requestId: requestId }); } catch (error) { self.postMessage({ ok: false, error: error instanceof Error ? error.message : 'Voxel worker failed.', requestId: requestId }); }};`;
       voxelBuildWorkerUrl = URL.createObjectURL(new Blob([workerScript], { type: 'text/javascript' }));
     }
 
@@ -274,11 +356,14 @@ function createVoxelBuildWorker(): Worker | null {
   }
 }
 
+// Run a build on a pooled worker, matching the response by `requestId` so a
+// single long-lived worker can service many sequential builds. Falls back to a
+// synchronous main-thread build when no worker is available (SSR / no Worker).
 function runVoxelBuildInWorker(
+  worker: Worker | null,
   request: BuildVoxelPortraitRequest,
+  requestId: number,
 ): Promise<BuildVoxelPortraitResult> {
-  const worker = createVoxelBuildWorker();
-
   if (!worker) {
     return Promise.resolve(buildVoxelPortrait(request));
   }
@@ -287,10 +372,13 @@ function runVoxelBuildInWorker(
     const cleanup = () => {
       worker.removeEventListener('message', handleMessage);
       worker.removeEventListener('error', handleError);
-      worker.terminate();
     };
 
     const handleMessage = (event: MessageEvent<BuildVoxelPortraitResponse>) => {
+      // Ignore responses belonging to other in-flight requests on this worker.
+      if (event.data.requestId !== requestId) {
+        return;
+      }
       cleanup();
       if (event.data.ok) {
         resolve(event.data.result);
@@ -307,7 +395,7 @@ function runVoxelBuildInWorker(
 
     worker.addEventListener('message', handleMessage);
     worker.addEventListener('error', handleError);
-    worker.postMessage(request);
+    worker.postMessage({ ...request, requestId });
   });
 }
 
@@ -363,8 +451,13 @@ export function VoxelPortraitCanvas({
   progress,
   options,
   onGenerationStateChange,
+  replayToken,
+  disperseToken,
+  convergeToken,
+  onStormPhaseChange,
+  onPerfSample,
 }: VoxelPortraitCanvasProps) {
-  const [cubes, setCubes] = useState<VoxelCubeData[] | null>(null);
+  const [displayCubes, setDisplayCubes] = useState<VoxelCubeData[] | null>(null);
   const [cubeSize, setCubeSize] = useState(0.05);
   const [cachedPixels, setCachedPixels] = useState<CachedPixels | null>(null);
   const [failed, setFailed] = useState(false);
@@ -374,10 +467,40 @@ export function VoxelPortraitCanvas({
   const [isHovering, setIsHovering] = useState(false);
   const [isPointerDown, setIsPointerDown] = useState(false);
   const [themeVersion, setThemeVersion] = useState(0);
+  // Particle-storm transition tokens read by the scene's state machine.
+  // These are internal scene drivers — distinct from the public `disperseToken`
+  // / `convergeToken` props, which are mapped onto them below.
+  const [transitionToken, setTransitionToken] = useState(0);
+  const [sceneConvergeToken, setSceneConvergeToken] = useState(0);
   const extractRunRef = useRef(0);
   const prepareRunRef = useRef(0);
+  const hasLoadedRef = useRef(false);
+  const transitionPendingRef = useRef(false);
+  const replayTokenRef = useRef(replayToken);
+  const disperseTokenRef = useRef(disperseToken);
+  const convergeTokenRef = useRef(convergeToken);
+  // One pooled worker per canvas instance: created lazily on first build,
+  // reused across image swaps, terminated on unmount. `undefined` = not yet
+  // attempted; `null` = no Worker support (build runs on the main thread).
+  const workerRef = useRef<Worker | null | undefined>(undefined);
+  const buildRequestIdRef = useRef(0);
+
+  // Terminate the pooled worker when the canvas unmounts.
+  useEffect(() => () => {
+    workerRef.current?.terminate();
+    workerRef.current = undefined;
+  }, []);
 
   const mergedOptions = useMemo(() => ({
+    quality: options?.quality ?? DEFAULT_OPTIONS.quality,
+    transition: {
+      ...DEFAULT_OPTIONS.transition,
+      ...options?.transition,
+      params: {
+        ...DEFAULT_OPTIONS.transition.params,
+        ...options?.transition?.params,
+      },
+    },
     color: {
       ...DEFAULT_OPTIONS.color,
       ...options?.color,
@@ -447,6 +570,42 @@ export function VoxelPortraitCanvas({
       ...options?.imagePlane,
     },
   }), [options]);
+
+  const qualityProfile = useMemo(
+    () => resolveQualityProfile(mergedOptions.quality),
+    [mergedOptions.quality],
+  );
+
+  // Quality caps applied on top of the consumer's generation settings.
+  const effectiveMaxCubes = useMemo(
+    () => Math.min(mergedOptions.generation.maxCubes ?? 8000, qualityProfile.maxCubes),
+    [mergedOptions.generation.maxCubes, qualityProfile.maxCubes],
+  );
+
+  const effectiveMaxResolution = useMemo<number | false>(() => {
+    const userResolution = mergedOptions.generation.maxResolution ?? 768;
+    if (qualityProfile.maxResolution === Number.POSITIVE_INFINITY) {
+      return userResolution;
+    }
+    const userValue = userResolution === false
+      ? Number.POSITIVE_INFINITY
+      : userResolution;
+    return Math.min(userValue, qualityProfile.maxResolution);
+  }, [mergedOptions.generation.maxResolution, qualityProfile.maxResolution]);
+
+  const dprMax = Math.min(
+    qualityProfile.dprMax,
+    mergedOptions.camera.dprMax ?? qualityProfile.dprMax,
+  );
+  const dprMin = Math.min(
+    dprMax,
+    mergedOptions.camera.dprMin ?? qualityProfile.dprMin,
+  );
+
+  const [dpr, setDpr] = useState(dprMax);
+  useEffect(() => {
+    setDpr(dprMax);
+  }, [dprMax]);
 
   useEffect(() => {
     if (!mergedOptions.color.useTheme || typeof window === 'undefined') {
@@ -543,7 +702,7 @@ export function VoxelPortraitCanvas({
   const pixelExtractionSignature = useMemo(
     () => JSON.stringify({
       imageSrc,
-      maxResolution: mergedOptions.generation.maxResolution,
+      maxResolution: effectiveMaxResolution,
       imageTransform: {
         imageScale: mergedOptions.render.imageScale,
         imageOffsetX: mergedOptions.render.imageOffsetX,
@@ -553,7 +712,7 @@ export function VoxelPortraitCanvas({
     }),
     [
       imageSrc,
-      mergedOptions.generation.maxResolution,
+      effectiveMaxResolution,
       mergedOptions.render.imageScale,
       mergedOptions.render.imageOffsetX,
       mergedOptions.render.imageOffsetY,
@@ -569,7 +728,7 @@ export function VoxelPortraitCanvas({
         density: mergedOptions.generation.density,
         cubeSize: mergedOptions.generation.cubeSize,
         alphaThreshold: mergedOptions.generation.alphaThreshold,
-        maxCubes: mergedOptions.generation.maxCubes,
+        maxCubes: effectiveMaxCubes,
         depthMultiplier: mergedOptions.generation.depthMultiplier,
       },
       explosion: mergedOptions.explosion,
@@ -580,7 +739,7 @@ export function VoxelPortraitCanvas({
       mergedOptions.generation.density,
       mergedOptions.generation.cubeSize,
       mergedOptions.generation.alphaThreshold,
-      mergedOptions.generation.maxCubes,
+      effectiveMaxCubes,
       mergedOptions.generation.depthMultiplier,
       mergedOptions.explosion,
     ],
@@ -609,7 +768,7 @@ export function VoxelPortraitCanvas({
         setFailed(false);
 
         const extractImageOptions: ExtractImagePixelsOptions = {
-          maxResolution: mergedOptions.generation.maxResolution ?? 768,
+          maxResolution: effectiveMaxResolution,
           imageScale: mergedOptions.render.imageScale ?? 1,
           offsetX: mergedOptions.render.imageOffsetX ?? 0,
           offsetY: mergedOptions.render.imageOffsetY ?? 0,
@@ -668,7 +827,7 @@ export function VoxelPortraitCanvas({
         density: mergedOptions.generation.density,
         cubeSize: mergedOptions.generation.cubeSize,
         alphaThreshold: mergedOptions.generation.alphaThreshold,
-        maxCubes: mergedOptions.generation.maxCubes,
+        maxCubes: effectiveMaxCubes,
         depthMultiplier: mergedOptions.generation.depthMultiplier,
       },
       explosion: {
@@ -679,12 +838,30 @@ export function VoxelPortraitCanvas({
       },
     };
 
-    runVoxelBuildInWorker(request)
+    if (workerRef.current === undefined) {
+      workerRef.current = createVoxelBuildWorker();
+    }
+    buildRequestIdRef.current += 1;
+
+    runVoxelBuildInWorker(workerRef.current, request, buildRequestIdRef.current)
       .then((prepared) => {
         if (!cancelled && runId === prepareRunRef.current) {
           setFailed(false);
           setCubeSize(prepared.cubeSize);
-          setCubes(prepared.cubes);
+
+          const isFirstLoad = !hasLoadedRef.current;
+          hasLoadedRef.current = true;
+
+          if (transitionPendingRef.current && !isFirstLoad) {
+            // A storm is mid-flight for an image change: swap the rendered
+            // cubes (hidden by the swirl) and ask the scene to reassemble.
+            transitionPendingRef.current = false;
+            setDisplayCubes(prepared.cubes);
+            setSceneConvergeToken((token) => token + 1);
+          } else {
+            // First load, or a non-image rebuild (e.g. quality change): no storm.
+            setDisplayCubes(prepared.cubes);
+          }
         }
       })
       .catch((err) => {
@@ -717,6 +894,66 @@ export function VoxelPortraitCanvas({
     mergedOptions.explosion.rotationStrength,
     mergedOptions.explosion.seed,
   ]);
+
+  // When the image changes after the first load, kick off the disperse phase
+  // immediately (the new build runs in parallel and triggers the converge).
+  useEffect(() => {
+    if (!hasLoadedRef.current) {
+      return;
+    }
+    if (!mergedOptions.transition.enabled || prefersReducedMotion) {
+      transitionPendingRef.current = false;
+      return;
+    }
+    transitionPendingRef.current = true;
+    setTransitionToken((token) => token + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageSrc]);
+
+  // Replay the storm against the current cubes (no rebuild) when the consumer
+  // bumps `replayToken` — for previewing styles. Ignores transition.enabled /
+  // reduced-motion since it is an explicit action.
+  useEffect(() => {
+    if (replayToken === replayTokenRef.current) {
+      return;
+    }
+    replayTokenRef.current = replayToken;
+    if (!hasLoadedRef.current) {
+      return;
+    }
+    setTransitionToken((token) => token + 1);
+    setSceneConvergeToken((token) => token + 1);
+  }, [replayToken]);
+
+  // Consumer-controlled storm: disperse and HOLD open. Decoupled from
+  // `convergeToken` so the storm stays in `hold` until the consumer releases it.
+  // Like `replayToken`, this is an explicit action and ignores
+  // transition.enabled / reduced-motion.
+  useEffect(() => {
+    if (disperseToken === disperseTokenRef.current) {
+      return;
+    }
+    disperseTokenRef.current = disperseToken;
+    if (!hasLoadedRef.current) {
+      return;
+    }
+    // Not a build-driven storm: ensure a pending image swap doesn't auto-converge.
+    transitionPendingRef.current = false;
+    setTransitionToken((token) => token + 1);
+  }, [disperseToken]);
+
+  // Release a held storm → converge into the current cubes. The scene latches
+  // this if it arrives before `hold` is reached, and honours `minHold`.
+  useEffect(() => {
+    if (convergeToken === convergeTokenRef.current) {
+      return;
+    }
+    convergeTokenRef.current = convergeToken;
+    if (!hasLoadedRef.current) {
+      return;
+    }
+    setSceneConvergeToken((token) => token + 1);
+  }, [convergeToken]);
 
   useEffect(() => {
     onGenerationStateChange?.(isExtracting || isPreparing);
@@ -765,7 +1002,7 @@ export function VoxelPortraitCanvas({
     return Boolean(canvas.getContext('webgl2') || canvas.getContext('webgl'));
   }, []);
 
-  if (failed || !canUseWebGL || !cubes) {
+  if (failed || !canUseWebGL || !displayCubes) {
     if (fallbackImage) {
       return (
         <div style={{ position: 'relative', height: '100%', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -783,16 +1020,13 @@ export function VoxelPortraitCanvas({
 
   return (
     <Canvas
-      dpr={[
-        mergedOptions.camera.dprMin ?? 1,
-        mergedOptions.camera.dprMax ?? 1.75,
-      ]}
+      dpr={qualityProfile.adaptive ? dpr : [dprMin, dprMax]}
       camera={{
         fov: mergedOptions.camera.fov ?? 60,
         position: [0, 0, mergedOptions.camera.z ?? 16],
       }}
       style={{ height: '100%', width: '100%' }}
-      gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}
+      gl={{ antialias: qualityProfile.antialias, alpha: true, powerPreference: 'high-performance', preserveDrawingBuffer: mergedOptions.render.preserveDrawingBuffer ?? false }}
       onPointerEnter={() => setIsHovering(true)}
       onPointerLeave={() => {
         setIsHovering(false);
@@ -801,6 +1035,12 @@ export function VoxelPortraitCanvas({
       onPointerDown={() => setIsPointerDown(true)}
       onPointerUp={() => setIsPointerDown(false)}
     >
+      {qualityProfile.adaptive && (
+        <PerformanceMonitor
+          onDecline={() => setDpr((value) => Math.max(dprMin, Math.round((value - 0.25) * 100) / 100))}
+          onIncline={() => setDpr((value) => Math.min(dprMax, Math.round((value + 0.25) * 100) / 100))}
+        />
+      )}
       <ambientLight intensity={mergedOptions.lighting.ambientIntensity} />
       <directionalLight
         position={mergedOptions.lighting.keyLight.position}
@@ -813,7 +1053,7 @@ export function VoxelPortraitCanvas({
         color={mergedOptions.lighting.fillLight.color}
       />
       <VoxelPortraitScene
-        cubes={cubes}
+        cubes={displayCubes}
         cubeSize={cubeSize}
         portraitScale={mergedOptions.render.portraitScale ?? 1}
         progress={scrollProgress}
@@ -829,6 +1069,17 @@ export function VoxelPortraitCanvas({
         imagePlaneTransitionRange={mergedOptions.imagePlane.transitionRange ?? 1}
         imagePlaneSuppressGridArtifacts={mergedOptions.imagePlane.suppressGridArtifacts ?? false}
         isHovering={isHovering}
+        capacity={effectiveMaxCubes}
+        sphereSegments={qualityProfile.sphereSegments}
+        transitionStyle={mergedOptions.transition.style}
+        transitionParams={mergedOptions.transition.params}
+        transitionToken={transitionToken}
+        convergeToken={sceneConvergeToken}
+        onStormPhaseChange={onStormPhaseChange}
+        onPerfSample={onPerfSample}
+        disperseDuration={mergedOptions.transition.disperseDuration}
+        convergeDuration={mergedOptions.transition.convergeDuration}
+        minHold={mergedOptions.transition.minHold}
       />
       <OrbitControls
         enablePan={mergedOptions.controls.enablePan}
